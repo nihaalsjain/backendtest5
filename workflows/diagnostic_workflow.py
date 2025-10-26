@@ -398,59 +398,72 @@ class AsyncDiagnosticAgent:
             }
             language_instruction = lang_directives.get(self.target_language, lang_directives["en"])
 
+            # In the assistant_node function, update the system message:
+
             system_msg = SystemMessage(content=f"""
-You are Allion, a RAG-based automotive diagnostic assistant.
+            You are Allion, a RAG-based automotive diagnostic assistant.
 
-{language_instruction}
+            {language_instruction}
 
-🚫 CRITICAL RESTRICTION: You are FORBIDDEN from using your pre-trained knowledge about vehicles.
-🚫 You MUST NOT answer any automotive question without using the provided tools.
-🚫 If you cannot get information through tools, you must say "I don't have that information in my database."
+            🚫 CRITICAL RESTRICTION: You are FORBIDDEN from using your pre-trained knowledge about vehicles.
+            🚫 You MUST NOT answer any automotive question without using the provided tools.
+            🚫 If you cannot get information through tools, you must say "I don't have that information in my database."
 
-✅ MANDATORY TOOL WORKFLOW - You MUST follow this EXACT sequence for ALL queries:
+            ✅ MANDATORY TOOL WORKFLOW - You MUST follow this EXACT sequence for ALL queries:
 
-STEP 1: ALWAYS call is_vehicle_related first
-- If not vehicle-related, politely decline
+            STEP 1: ALWAYS call is_vehicle_related first
+            - If not vehicle-related, politely decline
 
-STEP 2: ALWAYS call extract_vehicle_model
-- Even for DTC questions, call this tool
-                                       
-STEP 3: Check vehicle info requirement:
-    - For repair/maintenance questions: IF no vehicle found → STOP and ask for make/model
-    - For DTC codes (P0301, etc.): Continue without requiring vehicle info
-    - Generate response: "Could you please specify the make and model of your vehicle? For example, 'Honda Civic' or 'Toyota Camry'. This helps me provide more accurate diagnostic information."
-    
-STEP 4: IF vehicle info available, enhance the question
-    - Transform "how to change brake pads" + "Honda Civic" → "how to change brake pads of Honda Civic"                                       
+            STEP 2: ALWAYS call extract_vehicle_model
+            - Even for DTC questions, call this tool
+                                                
+            STEP 3: Check vehicle info requirement:
+                - For repair/maintenance questions: IF no vehicle found → STOP and ask for make/model
+                - For DTC codes (P0301, etc.): Continue without requiring vehicle info
+                - Generate response: "Could you please specify the make and model of your vehicle? For example, 'Honda Civic' or 'Toyota Camry'. This helps me provide more accurate diagnostic information."
+                
+            STEP 4: IF vehicle info available, enhance the question
+                - Transform "how to change brake pads" + "Honda Civic" → "how to change brake pads of Honda Civic"                                       
 
-STEP 5: ALWAYS call search_vehicle_documents  
-- Never skip this step
-- This searches your knowledge base for relevant information
+            STEP 5: ALWAYS call search_vehicle_documents  
+            - Never skip this step
+            - This searches your knowledge base for relevant information
+            - STORE the result in a variable called 'search_result'
 
-STEP 6: ALWAYS call grade_document_relevance 
-- Pass: question, document_content, chunk_label
-- This determines if the retrieved information is sufficient
+            STEP 6: ALWAYS call grade_document_relevance 
+            - Pass: question, search_result.selected_chunk_content, search_result.selected_chunk_label
+            - This determines if the retrieved information is sufficient
+            - STORE the result in a variable called 'relevance_result'
 
-STEP 7: Based on relevance score: 
-- IF score = 1: Skip web search, go to formatting
-- IF score = 0: Call search_web_for_vehicle_info AND search_youtube_videos
+            STEP 7: Based on relevance score: 
+            - IF relevance_result.relevance_score = 1: Skip web search, go to formatting
+            - IF relevance_result.relevance_score = 0: Call search_web_for_vehicle_info AND search_youtube_videos
 
-STEP 8: ALWAYS call format_diagnostic_results 
-- This creates your final response
+            STEP 8: ALWAYS call format_diagnostic_results 
+            - CRITICAL: Pass the ORIGINAL search_result.selected_chunk_content (WITH images)
+            - Parameters: question, search_result.selected_chunk_content, web_results, youtube_results, dtc_code, relevance_result.relevance_score
+            - This creates your final response
 
-🚫 FORBIDDEN BEHAVIORS:
-- Do NOT answer questions directly without using tools
-- Do NOT use your knowledge about P0301, engine codes, or any automotive topics
-- Do NOT provide diagnostic advice without retrieving it through tools
-- Do NOT skip any steps in the workflow
+            🚫 FORBIDDEN BEHAVIORS:
+            - Do NOT answer questions directly without using tools
+            - Do NOT use your knowledge about P0301, engine codes, or any automotive topics
+            - Do NOT provide diagnostic advice without retrieving it through tools
+            - Do NOT skip any steps in the workflow
+            - Do NOT pass different content to grade_document_relevance and format_diagnostic_results
 
-✅ REQUIRED RESPONSES:
-- If tools return no information: "I don't have specific information about this in my diagnostic database."
-- If you're tempted to answer from memory: STOP and use tools instead
-- Always base your response ONLY on tool results
+            ✅ REQUIRED DATA FLOW:
+            - search_vehicle_documents → selected_chunk_content (WITH IMAGES)
+            - grade_document_relevance gets: selected_chunk_content (same content WITH IMAGES)  
+            - format_diagnostic_results gets: selected_chunk_content (same content WITH IMAGES)
 
-REMEMBER: You are a RAG assistant, not a general automotive expert. Your knowledge comes ONLY from the tools.
-""")
+            ✅ REQUIRED RESPONSES:
+            - If tools return no information: "I don't have specific information about this in my diagnostic database."
+            - If you're tempted to answer from memory: STOP and use tools instead
+            - Always base your response ONLY on tool results
+
+            REMEMBER: You are a RAG assistant, not a general automotive expert. Your knowledge comes ONLY from the tools.
+            The SAME content with images must flow through both grade_document_relevance and format_diagnostic_results.
+            """)
             
             messages = [system_msg] + state.get("messages", [])
             tools_llm_with_tools = tools_llm.bind_tools(TOOLS)
@@ -731,30 +744,11 @@ REMEMBER: You are a RAG assistant, not a general automotive expert. Your knowled
                     "en": "Sorry, I'm not sure if this is related to a vehicle. Could you please ask me specifically about vehicle-related questions?",
                 }[self.target_language]
             
-            # STEP 1: First scan ALL messages for structured tool output (format_diagnostic_results)
-            for msg in reversed(messages):
-                if hasattr(msg, "content") and msg.content:
-                    response_content = msg.content
-                    
-                    # Check if it's a structured JSON response from format_diagnostic_results tool
-                    if isinstance(response_content, str) and response_content.strip().startswith('{'):
-                        try:
-                            structured_response = json.loads(response_content)
-                            if "voice_output" in structured_response and "text_output" in structured_response:
-                                logger.info(f"✅ Found structured tool output: voice={len(structured_response['voice_output'])} chars, text_sources={len(structured_response.get('text_output', {}).get('web_sources', []))}")
-                                # Return structured response for LiveKit to handle
-                                return json.dumps(structured_response)
-                        except json.JSONDecodeError:
-                            # Not JSON, continue scanning
-                            pass
-            
-            # STEP 2: If no structured output found, fall back to last assistant message
+            # Extract assistant response
             for msg in reversed(messages):
                 if hasattr(msg, "content") and msg.content and not isinstance(msg, HumanMessage):
-                    response_content = msg.content
-                    
                     # Validate the response doesn't contain generic automotive knowledge
-                    if self._contains_generic_knowledge(str(response_content)):
+                    if self._contains_generic_knowledge(msg.content):
                         logger.warning("⚠️ Response contains generic knowledge, not tool output")
                         if self.current_conversation_id:
                             conversation_logger.log_error(
@@ -767,7 +761,19 @@ REMEMBER: You are a RAG assistant, not a general automotive expert. Your knowled
                             "kn": "ಗಮನಿಸಿ: ಈ ಉತ್ತರವು ಡಯಗ್ನೋಸ್ಟಿಕ್ ಡೇಟಾಬೇಸ್‌ಗಿಂತ ಸಾಮಾನ್ಯ ಜ್ಞಾನ ಆಧಾರಿತವಾಗಿದೆ.",
                             "en": "I should let you know: I'm answering this using my pre-trained/existing knowledge, not from the diagnostic database.",
                         }[self.target_language]
-                    return str(response_content)
+                    # NEW: If tool produced structured JSON (from format_diagnostic_results), convert to VOICE|||TEXT
+                    try:
+                        parsed = json.loads(msg.content)
+                        if isinstance(parsed, dict) and 'voice_output' in parsed and 'text_output' in parsed:
+                            voice = parsed.get('voice_output', '')
+                            text_part = parsed.get('text_output', {})
+                            # Preserve full text_output JSON for frontend panel parsing
+                            text_json = json.dumps(text_part, ensure_ascii=False)
+                            combined = f"VOICE:{voice}|||TEXT:{text_json}"
+                            return combined
+                    except Exception:
+                        pass
+                    return msg.content
             
             return {
                 "hi": "क्षमा करें, मैं आपके अनुरोध को प्रोसेस नहीं कर सका।",
@@ -936,44 +942,7 @@ class DiagnosticLLMStream(LLMStream):
     async def _get_response(self) -> str:
         """Get the response from the diagnostic agent."""
         try:
-            response = await self._agent.chat(self._message)
-            
-            # Check if response is structured (JSON with voice/text outputs)
-            if isinstance(response, str) and response.strip().startswith('{'):
-                try:
-                    structured_data = json.loads(response)
-                    if "voice_output" in structured_data and "text_output" in structured_data:
-                        voice_output = structured_data.get("voice_output", "")
-                        text_output = structured_data.get("text_output", response)
-                        
-                        # Create a special format that the frontend can parse
-                        # Format: VOICE:voice_content|||TEXT:text_content
-                        if isinstance(text_output, dict) and "content" in text_output:
-                            # Web search results with sources
-                            content = text_output["content"]
-                            web_sources = text_output.get("web_sources", [])
-                            youtube_videos = text_output.get("youtube_videos", [])
-                            
-                            # Create structured text output with embedded JSON for frontend parsing
-                            text_data = {
-                                "content": content,
-                                "web_sources": web_sources,
-                                "youtube_videos": youtube_videos,
-                                "has_external_sources": len(web_sources) > 0 or len(youtube_videos) > 0
-                            }
-                            
-                            # Return special format for frontend to parse
-                            combined_response = f"VOICE:{voice_output}|||TEXT:{json.dumps(text_data)}"
-                            return combined_response
-                        else:
-                            # Simple text output (RAG results)
-                            combined_response = f"VOICE:{voice_output}|||TEXT:{str(text_output)}"
-                            return combined_response
-                except json.JSONDecodeError:
-                    # Not structured JSON, return as-is
-                    pass
-            
-            return response
+            return await self._agent.chat(self._message)
         except Exception as e:
             logger.exception("Error getting response from diagnostic agent")
             return f"I apologize, but I encountered an error processing your request: {e}"
