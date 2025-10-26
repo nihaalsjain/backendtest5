@@ -731,22 +731,27 @@ REMEMBER: You are a RAG assistant, not a general automotive expert. Your knowled
                     "en": "Sorry, I'm not sure if this is related to a vehicle. Could you please ask me specifically about vehicle-related questions?",
                 }[self.target_language]
             
-            # Extract assistant response and handle structured output
+            # STEP 1: First scan ALL messages for structured tool output (format_diagnostic_results)
             for msg in reversed(messages):
-                if hasattr(msg, "content") and msg.content and not isinstance(msg, HumanMessage):
-                    # Try to parse structured response from format_diagnostic_results
+                if hasattr(msg, "content") and msg.content:
                     response_content = msg.content
                     
-                    # Check if it's a JSON response from format_diagnostic_results
+                    # Check if it's a structured JSON response from format_diagnostic_results tool
                     if isinstance(response_content, str) and response_content.strip().startswith('{'):
                         try:
                             structured_response = json.loads(response_content)
                             if "voice_output" in structured_response and "text_output" in structured_response:
+                                logger.info(f"✅ Found structured tool output: voice={len(structured_response['voice_output'])} chars, text_sources={len(structured_response.get('text_output', {}).get('web_sources', []))}")
                                 # Return structured response for LiveKit to handle
                                 return json.dumps(structured_response)
                         except json.JSONDecodeError:
-                            # Not JSON, continue with normal processing
+                            # Not JSON, continue scanning
                             pass
+            
+            # STEP 2: If no structured output found, fall back to last assistant message
+            for msg in reversed(messages):
+                if hasattr(msg, "content") and msg.content and not isinstance(msg, HumanMessage):
+                    response_content = msg.content
                     
                     # Validate the response doesn't contain generic automotive knowledge
                     if self._contains_generic_knowledge(str(response_content)):
